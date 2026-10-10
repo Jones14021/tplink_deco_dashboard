@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv-deco/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "python-envs.workspaceSearchPaths": [
+    "./.venv-deco"
+  ]
+}
