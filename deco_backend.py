@@ -1,300 +1,287 @@
 #!/usr/bin/env python3
 
 import argparse
-import dataclasses
-import enum
 import json
 import logging
-import sys
+import threading
 import time
-from datetime import datetime, timezone
+from contextlib import contextmanager
 from getpass import getpass
-from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
 
-from tplinkrouterc6u import TplinkRouterProvider
+from tplinkrouterc6u import Connection, TplinkRouterProvider
 
-logger = logging.getLogger("deco-diagnostics")
+BANDS = {
+    "2g": (Connection.HOST_2G, "wifi_2g_enable"),
+    "5g": (Connection.HOST_5G, "wifi_5g_enable"),
+    "6g": (Connection.HOST_6G, "wifi_6g_enable"),
+}
+
+LOG = logging.getLogger("deco")
 
 
-def to_plain(value):
-    """Convert library result objects to JSON-compatible values."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
+def text(value):
+    return None if value is None else str(value)
 
-    if isinstance(value, enum.Enum):
-        return value.name
 
-    if isinstance(value, dict):
-        return {str(key): to_plain(item) for key, item in value.items()}
+def connection_name(value):
+    return getattr(value, "name", str(value))
 
-    if isinstance(value, (list, tuple, set)):
-        return [to_plain(item) for item in value]
 
-    if dataclasses.is_dataclass(value):
-        return {
-            field.name: to_plain(getattr(value, field.name))
-            for field in dataclasses.fields(value)
-            if not field.name.startswith("_")
-        }
+class DecoBackend:
+    """
+    Reads mesh-node connectivity and network-wide main-Wi-Fi information.
 
-    # Include public instance attributes and properties, but no methods
-    # or private implementation/session data.
-    attributes = {}
+    Writes are network-wide, experimental, and disabled by default.
+    No per-node write endpoint is assumed.
+    """
 
-    try:
-        attributes.update(
-            {key: item for key, item in vars(value).items() if not key.startswith("_")}
-        )
-    except TypeError:
-        pass
+    def __init__(self, host, password, allow_writes=False, verify_ssl=False):
+        self.host = host
+        self.password = password
+        self.allow_writes = allow_writes
+        self.verify_ssl = verify_ssl
+        self.lock = threading.Lock()
 
-    for cls in type(value).__mro__:
-        for name, descriptor in vars(cls).items():
-            if name.startswith("_") or not isinstance(descriptor, property):
-                continue
+    @contextmanager
+    def session(self):
+        # Serializes sessions within this process.
+        with self.lock:
+            router = TplinkRouterProvider.get_client(
+                self.host,
+                self.password,
+                verify_ssl=self.verify_ssl,
+                logger=LOG,
+            )
+            if router is None:
+                raise RuntimeError("No supported client detected.")
+
             try:
-                attributes[name] = getattr(value, name)
-            except Exception:
-                pass
+                router.authorize()
+                yield router
+            finally:
+                try:
+                    router.logout()
+                except Exception:
+                    LOG.warning("Logout failed", exc_info=True)
 
-    if attributes:
-        return {key: to_plain(item) for key, item in attributes.items()}
+    @staticmethod
+    def read_wifi(router):
+        status = router.get_status()
+        return {
+            band: getattr(status, attribute, None)
+            for band, (_, attribute) in BANDS.items()
+        }, status
 
-    # Handles IP-address and MAC-address value objects.
-    return str(value)
+    def snapshot(self):
+        with self.session() as router:
+            nodes = router.get_mesh_nodes()
+            wifi, status = self.read_wifi(router)
 
+            counts = {
+                "host": {band: 0 for band in BANDS},
+                "guest": {band: 0 for band in BANDS},
+                "iot": {band: 0 for band in BANDS},
+            }
+            unknown_active_clients = 0
 
-def show_json(value):
-    print(json.dumps(value, indent=2, ensure_ascii=False))
+            for device in getattr(status, "devices", []) or []:
+                if getattr(device, "active", None) is False:
+                    continue
 
+                kind = connection_name(getattr(device, "type", None))
+                found = False
 
-def run_query(router, method_name, report):
-    """Run one read operation; retain errors without stopping other tests."""
-    print(f"\n--- {method_name} ---", flush=True)
+                for network in counts:
+                    for band in BANDS:
+                        if kind == f"{network.upper()}_{band.upper()}":
+                            counts[network][band] += 1
+                            found = True
 
-    method = getattr(router, method_name, None)
-    if not callable(method):
-        report["queries"][method_name] = {"state": "unavailable"}
-        print("Method is not available in this installed client.")
-        return None
+                if not found:
+                    unknown_active_clients += 1
 
-    start = time.monotonic()
+            result_nodes = []
+            for node in nodes:
+                state = getattr(node, "status", None)
+                online = (
+                    True
+                    if state == "connected"
+                    else False if state == "disconnected" else None
+                )
 
-    try:
-        result = method()
-        elapsed = round(time.monotonic() - start, 3)
-        plain = to_plain(result)
+                result_nodes.append(
+                    {
+                        "id": text(getattr(node, "macaddr", None)),
+                        "name": getattr(node, "name", None),
+                        "ip": text(getattr(node, "ipaddr", None)),
+                        "model": getattr(node, "model", None),
+                        "role": getattr(node, "role", None),
+                        "reported_status": state,
+                        "online": online,
+                        # Intentionally not populated from global status.
+                        "wifi": {band: None for band in BANDS},
+                        "clients_per_band": {band: None for band in BANDS},
+                        "individual_toggle_supported": False,
+                    }
+                )
 
-        report["queries"][method_name] = {
-            "state": "ok",
-            "seconds": elapsed,
-            "data": plain,
+            return {
+                "observed_at": time.time(),
+                "nodes": result_nodes,
+                "network": {
+                    "wifi": wifi,
+                    "clients": counts,
+                    "other_active_clients": unknown_active_clients,
+                },
+                "capabilities": {
+                    "node_wifi_status": False,
+                    "node_client_counts": False,
+                    "node_toggle": False,
+                    "experimental_network_writes": self.allow_writes,
+                },
+            }
+
+    def set_node_wifi(self, node_id, enabled):
+        raise NotImplementedError(
+            "Individual-node Wi-Fi control is not available through "
+            "the documented tplinkrouterc6u API. No write was sent."
+        )
+
+    def set_network_band(self, band, enabled, attempts=6, interval=3):
+        """
+        Send one write, then poll reported network configuration.
+
+        Verification means configuration read-back, not proof that every
+        physical radio/SSID stopped or started transmitting.
+        """
+        if not self.allow_writes:
+            raise PermissionError(
+                "Writes are disabled. Start with --allow-network-writes "
+                "to enable experimental network-wide control."
+            )
+        if band not in BANDS:
+            raise ValueError(f"Unknown band: {band}")
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be bool")
+
+        result = {
+            "scope": "network",
+            "band": band,
+            "desired": enabled,
+            "write_error": None,
+            "verified": False,
+            "verification_scope": "reported_configuration",
+            "observations": [],
         }
 
-        print(f"Completed in {elapsed:.3f}s")
-        show_json(plain)
+        with self.session() as router:
+            before, _ = self.read_wifi(router)
+            result["before"] = before[band]
+
+            if before[band] is enabled:
+                result["verified"] = True
+                result["already_in_desired_state"] = True
+                return result
+
+            try:
+                router.set_wifi(BANDS[band][0], enabled)
+            except Exception as exc:
+                # A failed HTTP response does not prove nothing changed.
+                result["write_error"] = f"{type(exc).__name__}: {exc}"
+
+            for attempt in range(1, attempts + 1):
+                time.sleep(interval)
+                observation = {"attempt": attempt}
+
+                try:
+                    wifi, _ = self.read_wifi(router)
+                    observation["reported"] = wifi[band]
+                    if wifi[band] is enabled:
+                        result["verified"] = True
+                except Exception as exc:
+                    observation["error"] = f"{type(exc).__name__}: {exc}"
+
+                result["observations"].append(observation)
+                if result["verified"]:
+                    break
+
         return result
 
-    except NotImplementedError:
-        report["queries"][method_name] = {
-            "state": "unsupported",
-            "seconds": round(time.monotonic() - start, 3),
-        }
-        print("Not implemented by this client.")
-        return None
 
-    except Exception as exc:
-        report["queries"][method_name] = {
-            "state": "error",
-            "seconds": round(time.monotonic() - start, 3),
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-        }
-        logger.exception("%s failed; continuing with other read tests", method_name)
-        return None
-
-
-def display_nodes(nodes, report):
-    """Produce a small, stable projection suitable for a dashboard."""
-    fields = (
-        "name",
-        "location",
-        "macaddr",
-        "ipaddr",
-        "model",
-        "role",
-        "is_main_router",
-        "status",
-        "connect_type",
-        "parent_macaddr",
-        "client_num",
-        "hardware_version",
-        "firmware_version",
-        "internet_status",
-        "signal_2g",
-        "signal_5g",
-    )
-
-    dashboard_nodes = []
-    for node in nodes:
-        entry = {field: to_plain(getattr(node, field, None)) for field in fields}
-        dashboard_nodes.append(entry)
-
-    report["dashboard_nodes"] = dashboard_nodes
-
-    print("\n=== Mesh-node names / dashboard summary ===")
-
-    if not dashboard_nodes:
-        print("The query returned no mesh nodes.")
-        return
-
-    for number, node in enumerate(dashboard_nodes, start=1):
-        label = node["name"] or node["location"] or node["macaddr"] or f"Node {number}"
-
-        print(f"\n{number}. {label}")
-        print(f"   Reported name: {node['name']}")
-        print(f"   Location:      {node['location']}")
-        print(f"   Model:         {node['model']}")
-        print(f"   Role:          {node['role']}")
-        print(f"   Main node:     {node['is_main_router']}")
-        print(f"   MAC:           {node['macaddr']}")
-        print(f"   IP:            {node['ipaddr']}")
-        print(f"   Status:        {node['status']}")
-        print(f"   Uplink:        {node['connect_type']}")
-        print(f"   Clients:       {node['client_num']}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Read-only TP-Link Deco diagnostics.")
-    parser.add_argument(
-        "--host",
-        default="https://192.168.178.172",
-        help="Main Deco URL (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--verify-ssl",
-        action="store_true",
-        help="Enable TLS certificate verification.",
-    )
-    parser.add_argument(
-        "--json",
-        type=Path,
-        help="Optionally save the diagnostic report to a local JSON file.",
-    )
+def cli():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="https://192.168.178.172")
+    parser.add_argument("--verify-ssl", action="store_true")
+    parser.add_argument("--allow-network-writes", action="store_true")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s: %(message)s",
-        stream=sys.stderr,
+    logging.basicConfig(level=logging.WARNING)
+
+    backend = DecoBackend(
+        args.host,
+        getpass("Deco web password: "),
+        allow_writes=args.allow_network_writes,
+        verify_ssl=args.verify_ssl,
     )
 
-    try:
-        package_version = version("tplinkrouterc6u")
-    except PackageNotFoundError:
-        package_version = "unknown"
+    while True:
+        try:
+            data = backend.snapshot()
+            print(json.dumps(data, indent=2, ensure_ascii=False))
 
-    report = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "host": args.host,
-        "library_version": package_version,
-        "verify_ssl": args.verify_ssl,
-        "queries": {},
-        "dashboard_nodes": [],
-    }
+            print("\n[r] refresh  [n] select active node")
+            print("[w] experimental network-wide band change  [q] quit")
+            command = input("> ").strip().lower()
 
-    print(f"Library version: {package_version}")
-    print(f"Target:          {args.host}")
-    print(f"TLS verification: {args.verify_ssl}")
-    print("Read-only queries only; no Wi-Fi or configuration changes.")
-
-    password = getpass("Deco web-interface password: ")
-    router = None
-    authorization_attempted = False
-    exit_code = 0
-
-    try:
-        print("\nDetecting client...", flush=True)
-        start = time.monotonic()
-
-        router = TplinkRouterProvider.get_client(
-            args.host,
-            password,
-            verify_ssl=args.verify_ssl,
-            logger=logger,
-        )
-
-        if router is None:
-            raise RuntimeError("Provider did not return a client.")
-
-        report["client_class"] = type(router).__name__
-        report["detection_seconds"] = round(time.monotonic() - start, 3)
-
-        print(
-            f"Selected {report['client_class']} "
-            f"in {report['detection_seconds']:.3f}s"
-        )
-
-        print("\nAuthorizing...", flush=True)
-        authorization_attempted = True
-        start = time.monotonic()
-        router.authorize()
-        report["authorization_seconds"] = round(time.monotonic() - start, 3)
-        print(f"Authorized in {report['authorization_seconds']:.3f}s")
-
-        # Query nodes early: this is the most interesting dashboard data.
-        nodes = run_query(router, "get_mesh_nodes", report)
-        if nodes is not None:
-            display_nodes(nodes, report)
-
-        run_query(router, "get_firmware", report)
-        run_query(router, "get_status", report)
-
-        # These may be absent or unsupported on your firmware/client.
-        for method_name in (
-            "get_ipv4_status",
-            "get_ipv6_status",
-            "get_ipv4_reservations",
-            "get_ipv4_dhcp_leases",
-        ):
-            run_query(router, method_name, report)
-
-    except Exception as exc:
-        exit_code = 1
-        report["fatal_error"] = {
-            "type": type(exc).__name__,
-            "message": str(exc),
-        }
-        logger.exception("Detection or authorization failed")
-
-    finally:
-        if router is not None and authorization_attempted:
-            print("\nLogging out...", flush=True)
-            try:
-                router.logout()
-                report["logout"] = "ok"
-                print("Logged out.")
-            except Exception as exc:
-                report["logout"] = {
-                    "state": "error",
-                    "message": str(exc),
-                }
-                logger.warning("Logout failed: %s", exc)
-
-        if args.json:
-            try:
-                args.json.write_text(
-                    json.dumps(report, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
+            if command == "q":
+                return
+            if command == "n":
+                active = [n for n in data["nodes"] if n["online"] is True]
+                if not active:
+                    print("No active nodes.")
+                    continue
+                for index, node in enumerate(active, 1):
+                    print(f"{index}: {node['name']} ({node['id']})")
+                index = int(input("Node number: ")) - 1
+                if not 0 <= index < len(active):
+                    raise ValueError("Invalid node number")
+                node = active[index]
+                print(
+                    f"{node['name']}: individual Wi-Fi state/counts and "
+                    "individual switching are unavailable. No write sent."
                 )
-                print(f"\nSaved local report: {args.json}")
-            except OSError:
-                logger.exception("Could not save JSON report")
-                exit_code = 1
+            elif command == "w":
+                if not backend.allow_writes:
+                    print("Writes disabled; use --allow-network-writes.")
+                    continue
 
-    return exit_code
+                band = input("Band [2g/5g/6g]: ").strip().lower()
+                if band not in BANDS:
+                    raise ValueError("Choose 2g, 5g, or 6g")
+
+                action = input("Desired state [on/off]: ").strip().lower()
+                if action not in ("on", "off"):
+                    raise ValueError("Choose on or off")
+
+                print(
+                    f"NETWORK-WIDE change: {band} -> {action}.\n"
+                    "This is NOT restricted to a selected node.\n"
+                    "Use Ethernet or another independent management path."
+                )
+                if input("Type APPLY to send this write: ").strip() == "APPLY":
+                    print(
+                        json.dumps(
+                            backend.set_network_band(band, action == "on"),
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        except Exception as exc:
+            print(f"Error: {exc}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli()
