@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import json
 import logging
 import threading
 import time
@@ -10,278 +9,300 @@ from getpass import getpass
 
 from tplinkrouterc6u import Connection, TplinkRouterProvider
 
+LOG = logging.getLogger("deco.backend")
+
 BANDS = {
     "2g": (Connection.HOST_2G, "wifi_2g_enable"),
     "5g": (Connection.HOST_5G, "wifi_5g_enable"),
     "6g": (Connection.HOST_6G, "wifi_6g_enable"),
 }
 
-LOG = logging.getLogger("deco")
+
+def configure_logging(debug=False):
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        format="%(asctime)s %(levelname)-7s [%(threadName)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+    # Keep transport chatter out of normal logs.
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
-def text(value):
-    return None if value is None else str(value)
+def wifi_state(wifi):
+    values = list(wifi.values())
+    if not all(isinstance(value, bool) for value in values):
+        return "unknown"
+    if all(values):
+        return "on"
+    if not any(values):
+        return "off"
+    return "mixed"
 
 
-def connection_name(value):
-    return getattr(value, "name", str(value))
+def format_wifi(wifi):
+    return ", ".join(
+        f"{band}={'ON' if value is True else 'OFF' if value is False else '?'}"
+        for band, value in wifi.items()
+    )
 
 
 class DecoBackend:
-    """
-    Reads mesh-node connectivity and network-wide main-Wi-Fi information.
-
-    Writes are network-wide, experimental, and disabled by default.
-    No per-node write endpoint is assumed.
-    """
-
-    def __init__(self, host, password, allow_writes=False, verify_ssl=False):
+    def __init__(self, host, password, verify_ssl=False):
         self.host = host
         self.password = password
-        self.allow_writes = allow_writes
         self.verify_ssl = verify_ssl
         self.lock = threading.Lock()
 
     @contextmanager
     def session(self):
-        # Serializes sessions within this process.
         with self.lock:
-            router = TplinkRouterProvider.get_client(
-                self.host,
-                self.password,
-                verify_ssl=self.verify_ssl,
-                logger=LOG,
-            )
-            if router is None:
-                raise RuntimeError("No supported client detected.")
+            router = None
+            started = time.monotonic()
 
             try:
+                LOG.info("Connecting to %s", self.host)
+
+                router = TplinkRouterProvider.get_client(
+                    self.host,
+                    self.password,
+                    verify_ssl=self.verify_ssl,
+                    logger=LOG,
+                )
+
+                if router is None:
+                    raise RuntimeError("No supported router client found.")
+
+                LOG.info("Selected client: %s", type(router).__name__)
                 router.authorize()
+                LOG.info("Authenticated in %.2fs", time.monotonic() - started)
                 yield router
             finally:
-                try:
-                    router.logout()
-                except Exception:
-                    LOG.warning("Logout failed", exc_info=True)
+                if router is not None:
+                    try:
+                        router.logout()
+                        LOG.info("Logged out")
+                    except Exception:
+                        LOG.exception("Logout failed")
 
     @staticmethod
-    def read_wifi(router):
+    def read_status(router):
+        started = time.monotonic()
+        LOG.info("Querying Wi-Fi state and clients")
         status = router.get_status()
-        return {
+
+        wifi = {
             band: getattr(status, attribute, None)
             for band, (_, attribute) in BANDS.items()
-        }, status
+        }
+        counts = {band: 0 for band in BANDS}
 
-    def snapshot(self):
-        with self.session() as router:
-            nodes = router.get_mesh_nodes()
-            wifi, status = self.read_wifi(router)
+        for device in getattr(status, "devices", []) or []:
+            if getattr(device, "active", None) is False:
+                continue
 
-            counts = {
-                "host": {band: 0 for band in BANDS},
-                "guest": {band: 0 for band in BANDS},
-                "iot": {band: 0 for band in BANDS},
-            }
-            unknown_active_clients = 0
+            kind = getattr(device, "type", None)
+            kind = getattr(kind, "name", str(kind))
 
-            for device in getattr(status, "devices", []) or []:
-                if getattr(device, "active", None) is False:
-                    continue
+            for band in BANDS:
+                if kind == f"HOST_{band.upper()}":
+                    counts[band] += 1
 
-                kind = connection_name(getattr(device, "type", None))
-                found = False
-
-                for network in counts:
-                    for band in BANDS:
-                        if kind == f"{network.upper()}_{band.upper()}":
-                            counts[network][band] += 1
-                            found = True
-
-                if not found:
-                    unknown_active_clients += 1
-
-            result_nodes = []
-            for node in nodes:
-                state = getattr(node, "status", None)
-                online = (
-                    True
-                    if state == "connected"
-                    else False if state == "disconnected" else None
-                )
-
-                result_nodes.append(
-                    {
-                        "id": text(getattr(node, "macaddr", None)),
-                        "name": getattr(node, "name", None),
-                        "ip": text(getattr(node, "ipaddr", None)),
-                        "model": getattr(node, "model", None),
-                        "role": getattr(node, "role", None),
-                        "reported_status": state,
-                        "online": online,
-                        # Intentionally not populated from global status.
-                        "wifi": {band: None for band in BANDS},
-                        "clients_per_band": {band: None for band in BANDS},
-                        "individual_toggle_supported": False,
-                    }
-                )
-
-            return {
-                "observed_at": time.time(),
-                "nodes": result_nodes,
-                "network": {
-                    "wifi": wifi,
-                    "clients": counts,
-                    "other_active_clients": unknown_active_clients,
-                },
-                "capabilities": {
-                    "node_wifi_status": False,
-                    "node_client_counts": False,
-                    "node_toggle": False,
-                    "experimental_network_writes": self.allow_writes,
-                },
-            }
-
-    def set_node_wifi(self, node_id, enabled):
-        raise NotImplementedError(
-            "Individual-node Wi-Fi control is not available through "
-            "the documented tplinkrouterc6u API. No write was sent."
+        LOG.info(
+            "Status in %.2fs: %s; main-network clients=%s",
+            time.monotonic() - started,
+            format_wifi(wifi),
+            counts,
         )
 
-    def set_network_band(self, band, enabled, attempts=6, interval=3):
-        """
-        Send one write, then poll reported network configuration.
+        return {
+            "wifi": wifi,
+            "state": wifi_state(wifi),
+            "clients": counts,
+        }
 
-        Verification means configuration read-back, not proof that every
-        physical radio/SSID stopped or started transmitting.
+    def snapshot(self):
+        started = time.monotonic()
+
+        with self.session() as router:
+            LOG.info("Querying mesh nodes")
+            raw_nodes = router.get_mesh_nodes()
+            nodes = []
+
+            for node in raw_nodes:
+                address = getattr(node, "macaddr", None)
+                ip = getattr(node, "ipaddr", None)
+
+                entry = {
+                    "id": str(address) if address is not None else None,
+                    "name": getattr(node, "name", None),
+                    "status": getattr(node, "status", None),
+                    "role": getattr(node, "role", None),
+                    "ip": str(ip) if ip is not None else None,
+                }
+                nodes.append(entry)
+
+                LOG.info(
+                    "Node: name=%s status=%s role=%s ip=%s",
+                    entry["name"],
+                    entry["status"],
+                    entry["role"],
+                    entry["ip"],
+                )
+
+            network = self.read_status(router)
+
+        LOG.info("Refresh completed in %.2fs", time.monotonic() - started)
+
+        return {
+            "observed_at": time.time(),
+            "nodes": nodes,
+            "network": network,
+        }
+
+    def set_main_wifi(self, enabled, attempts=6, interval=3):
         """
-        if not self.allow_writes:
-            raise PermissionError(
-                "Writes are disabled. Start with --allow-network-writes "
-                "to enable experimental network-wide control."
-            )
-        if band not in BANDS:
-            raise ValueError(f"Unknown band: {band}")
+        Change the three main-network bands and verify configuration read-back.
+
+        No automatic rollback or repeated writes are performed.
+        """
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be bool")
 
         result = {
-            "scope": "network",
-            "band": band,
             "desired": enabled,
-            "write_error": None,
             "verified": False,
-            "verification_scope": "reported_configuration",
+            "write_errors": {},
             "observations": [],
         }
 
+        LOG.warning(
+            "MAIN WI-FI CHANGE requested: all bands -> %s",
+            "ON" if enabled else "OFF",
+        )
+
         with self.session() as router:
-            before, _ = self.read_wifi(router)
-            result["before"] = before[band]
+            before = self.read_status(router)
+            result["before"] = before["wifi"]
 
-            if before[band] is enabled:
-                result["verified"] = True
-                result["already_in_desired_state"] = True
-                return result
+            # Do not overwrite bands whose state could not be queried.
+            if before["state"] == "unknown":
+                raise RuntimeError(
+                    "Cannot change Wi-Fi: current band state is unknown."
+                )
 
-            try:
-                router.set_wifi(BANDS[band][0], enabled)
-            except Exception as exc:
-                # A failed HTTP response does not prove nothing changed.
-                result["write_error"] = f"{type(exc).__name__}: {exc}"
+            for band, (connection, _) in BANDS.items():
+                if before["wifi"][band] is enabled:
+                    LOG.info("%s already matches target; skipping", band)
+                    continue
+
+                LOG.warning(
+                    "Writing main %s -> %s",
+                    band,
+                    "ON" if enabled else "OFF",
+                )
+                try:
+                    router.set_wifi(connection, enabled)
+                    LOG.info("%s write returned successfully", band)
+                except Exception as exc:
+                    result["write_errors"][band] = f"{type(exc).__name__}: {exc}"
+                    LOG.exception(
+                        "%s write failed; will still query actual state", band
+                    )
 
             for attempt in range(1, attempts + 1):
+                LOG.info(
+                    "Verification %d/%d in %ss",
+                    attempt,
+                    attempts,
+                    interval,
+                )
                 time.sleep(interval)
-                observation = {"attempt": attempt}
 
                 try:
-                    wifi, _ = self.read_wifi(router)
-                    observation["reported"] = wifi[band]
-                    if wifi[band] is enabled:
-                        result["verified"] = True
-                except Exception as exc:
-                    observation["error"] = f"{type(exc).__name__}: {exc}"
+                    network = self.read_status(router)
+                    observation = {
+                        "attempt": attempt,
+                        "wifi": network["wifi"],
+                    }
+                    result["observations"].append(observation)
 
-                result["observations"].append(observation)
-                if result["verified"]:
-                    break
+                    if all(value is enabled for value in network["wifi"].values()):
+                        result["verified"] = True
+                        LOG.info("Main Wi-Fi configuration verified")
+                        break
+
+                    LOG.warning(
+                        "Target not reached: %s",
+                        format_wifi(network["wifi"]),
+                    )
+                except Exception as exc:
+                    result["observations"].append(
+                        {
+                            "attempt": attempt,
+                            "error": str(exc),
+                        }
+                    )
+                    LOG.exception("Verification read failed")
+
+        if not result["verified"]:
+            LOG.error("Main Wi-Fi change NOT verified after %d attempts", attempts)
 
         return result
 
 
-def cli():
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="https://192.168.178.172")
     parser.add_argument("--verify-ssl", action="store_true")
-    parser.add_argument("--allow-network-writes", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.WARNING)
-
+    configure_logging(args.debug)
     backend = DecoBackend(
         args.host,
         getpass("Deco web password: "),
-        allow_writes=args.allow_network_writes,
         verify_ssl=args.verify_ssl,
     )
 
     while True:
         try:
-            data = backend.snapshot()
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+            snapshot = backend.snapshot()
+            network = snapshot["network"]
 
-            print("\n[r] refresh  [n] select active node")
-            print("[w] experimental network-wide band change  [q] quit")
+            print(f"\nMain Wi-Fi: {network['state'].upper()}")
+            print(format_wifi(network["wifi"]))
+            print(f"Clients: {network['clients']}")
+            print("[r] refresh  [t] toggle main Wi-Fi  [q] quit")
+
             command = input("> ").strip().lower()
-
             if command == "q":
                 return
-            if command == "n":
-                active = [n for n in data["nodes"] if n["online"] is True]
-                if not active:
-                    print("No active nodes.")
-                    continue
-                for index, node in enumerate(active, 1):
-                    print(f"{index}: {node['name']} ({node['id']})")
-                index = int(input("Node number: ")) - 1
-                if not 0 <= index < len(active):
-                    raise ValueError("Invalid node number")
-                node = active[index]
-                print(
-                    f"{node['name']}: individual Wi-Fi state/counts and "
-                    "individual switching are unavailable. No write sent."
-                )
-            elif command == "w":
-                if not backend.allow_writes:
-                    print("Writes disabled; use --allow-network-writes.")
-                    continue
+            if command != "t":
+                continue
 
-                band = input("Band [2g/5g/6g]: ").strip().lower()
-                if band not in BANDS:
-                    raise ValueError("Choose 2g, 5g, or 6g")
+            if network["state"] == "unknown":
+                print("State unknown; refresh first.")
+                continue
 
-                action = input("Desired state [on/off]: ").strip().lower()
-                if action not in ("on", "off"):
-                    raise ValueError("Choose on or off")
+            target = network["state"] != "on"
+            desired = "ON" if target else "OFF"
 
-                print(
-                    f"NETWORK-WIDE change: {band} -> {action}.\n"
-                    "This is NOT restricted to a selected node.\n"
-                    "Use Ethernet or another independent management path."
-                )
-                if input("Type APPLY to send this write: ").strip() == "APPLY":
-                    print(
-                        json.dumps(
-                            backend.set_network_band(band, action == "on"),
-                            indent=2,
-                            ensure_ascii=False,
-                        )
-                    )
-        except (EOFError, KeyboardInterrupt):
+            if (
+                input(f"Set all main Wi-Fi bands {desired}? Type APPLY: ").strip()
+                != "APPLY"
+            ):
+                continue
+
+            result = backend.set_main_wifi(target)
+            print("Verified." if result["verified"] else "Not verified.")
+
+        except (KeyboardInterrupt, EOFError):
             print()
             return
-        except Exception as exc:
-            print(f"Error: {exc}")
+        except Exception:
+            LOG.exception("Operation failed")
 
 
 if __name__ == "__main__":
-    cli()
+    main()
